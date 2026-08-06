@@ -1,25 +1,18 @@
 import sys
 import time
-import tempfile
-from contextlib import suppress
-from numbers import Number
 from itertools import cycle
-from pathlib import Path
-import statistics
-
-from collections.abc import Iterable, Sequence
 
 import torch
-import numpy as np
-import tqdm
 from tabulate import tabulate
 
 from torchstrap.utils import Ansi
-from .callbacks import Callback
+
+
+__all__ = ["EpochTimer", "PrintLog"]
+
 
 def filter_log_keys(keys, keys_ignored=None):
-    """Filter out keys that are generally to be ignored.
-    """
+    """Filter out keys that are generally to be ignored."""
     keys_ignored = keys_ignored or ()
     for key in keys:
         if not (
@@ -31,22 +24,37 @@ def filter_log_keys(keys, keys_ignored=None):
         ):
             yield key
 
-class EpochTimer(Callback):
-    """Measures the duration of each epoch and writes it to the
-    history with the name ``dur``.
+
+class EpochTimer:
+    """Plain start/stop wall-clock timer.
+
+    ``tic()`` marks the start; ``toc()`` returns the elapsed seconds since the
+    last ``tic`` (and remembers it as ``.last``). Drop it around an epoch — or
+    any span — in the manual loop.
     """
-    def __init__(self, **kwargs):
-        super(EpochTimer, self).__init__(**kwargs)
 
-        self.epoch_start_time_ = None
+    def __init__(self):
+        self._start = None
+        self.last = None
 
-    def on_epoch_begin(self, state, history, **kwargs):
-        self.epoch_start_time_ = time.time()
+    def tic(self) -> None:
+        self._start = time.perf_counter()
 
-    def on_epoch_end(self, state, history, **kwargs):
-        history.append('dur', time.time() - (self.epoch_start_time_ or 0))
+    def toc(self) -> float:
+        self.last = time.perf_counter() - (self._start or time.perf_counter())
+        return self.last
 
-class PrintLog(Callback):
+
+class PrintLog:
+    """Print one tabulated row of metrics per call.
+
+    A plain callable: build a row from explicit values, e.g.
+    ``PrintLog()(epoch=e, valid_loss=score, dur=timer.toc())``. ``(N,)`` tensor
+    values are reduced to mean (and ``±std`` shown when it exceeds ``1e-5``);
+    pass ``<key>_best`` as a bool to color the corresponding cell. The header is
+    printed once, on the first call.
+    """
+
     def __init__(
             self,
             keys_ignored=None,
@@ -55,132 +63,87 @@ class PrintLog(Callback):
             floatfmt='.4f',
             stralign='right',
     ):
-        self.keys_ignored = keys_ignored
         self.sink = sink
         self.tablefmt = tablefmt
         self.floatfmt = floatfmt
         self.stralign = stralign
-
-    def initialize(self):
         self.first_iteration_ = True
 
-        keys_ignored = self.keys_ignored
         if isinstance(keys_ignored, str):
             keys_ignored = [keys_ignored]
         self.keys_ignored_ = set(keys_ignored or [])
-        self.keys_ignored_.add('batches')
-        return self
 
     def format_row(self, row, key, color):
-        """For a given row from the table, format it (i.e. floating
-        points and color if applicable).
-
-        """
+        """Format a single cell (floats + best-coloring)."""
         value = row[key]
 
         if isinstance(value, bool) or value is None:
             return '+' if value else ''
 
-        if not isinstance(value, (Number, torch.Tensor)):
+        # Values arrive already reduced to python scalars by `_reduce`.
+        if not isinstance(value, (int, float)):
             return value
 
-        # determine if integer value
         is_integer = float(value).is_integer()
-        template = '{}' if is_integer \
-                                                    else '{:' + self.floatfmt + '}'
+        template = '{}' if is_integer else '{:' + self.floatfmt + '}'
 
-        # if numeric, there could be a 'best' key
         key_best = key + '_best'
         if (key_best in row) and row[key_best]:
             template = color + template + Ansi.ENDC.value
 
-        d_key = "d_"+key
+        d_key = "d_" + key
         if d_key in row:
-            dvalue = row["d_"+key]
+            dvalue = row[d_key]
             return f"{template.format(value)}+/-{template.format(dvalue)}"
         return template.format(value)
 
     def _sorted_keys(self, keys):
-        """Sort keys, dropping the ones that should be ignored.
-
-        The keys that are in ``self.ignored_keys`` or that end on
-        '_best' are dropped. Among the remaining keys:
-          * 'epoch' is put first;
-          * 'dur' is put last;
-          * keys that start with 'event_' are put just before 'dur';
-          * all remaining keys are sorted alphabetically.
-        """
+        """'epoch' first, 'dur' last, 'event_*' just before 'dur', rest sorted."""
         sorted_keys = []
 
-        # make sure 'epoch' comes first
         if ('epoch' in keys) and ('epoch' not in self.keys_ignored_):
             sorted_keys.append('epoch')
 
-        # ignore keys like *_best or event_*
         for key in filter_log_keys(sorted(keys), keys_ignored=self.keys_ignored_):
             if key != 'dur':
                 sorted_keys.append(key)
 
-        # add event_* keys
         for key in sorted(keys):
             if key.startswith('event_') and (key not in self.keys_ignored_):
                 sorted_keys.append(key)
 
-        # make sure 'dur' comes last
         if ('dur' in keys) and ('dur' not in self.keys_ignored_):
             sorted_keys.append('dur')
 
         return sorted_keys
 
-    def _yield_keys_formatted(self, history):
-        keys = history.keys()
-        keys_list = list(keys)
-        colors = cycle([color.value for color in Ansi if color != color.ENDC])
-        sorted_keys = self._sorted_keys(keys)
-
+    def _reduce(self, metrics):
+        """Collapse a raw metrics dict to a display row: reduce ``(N,)`` tensors
+        to mean (+ ``d_<key>`` std when notable), keep scalars as-is."""
         row = {}
-        for key in sorted_keys:
-            rows = history[key][-1]
-
-            if isinstance(rows, torch.Tensor):
-                row_std, row_mean = torch.std_mean(
-                    rows
-                )
-                row[key] = row_mean.item()
-                f_row_std = row_std.item()
-                if f_row_std > 1e-5: 
-                    row[f"d_{key}"] = f_row_std
-            
-            elif isinstance(rows, Sequence):
-                if isinstance(rows[0], (float, int)):
-                #if isinstance(rows[0], (float, int, torch.Tensor)):
-                    row[key] = statistics.mean(rows)
-                    row_std = statistics.stdev(rows)
-                    if row_std > 1e-5:
-                        row[f"d_{key}"] = row_std
-
-                elif isinstance(rows[0], bool):
-                    row[key] = any(rows)
-                else:
-                    row[key] = rows[0]
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor) and value.numel() > 1:
+                std, mean = torch.std_mean(value.float())
+                row[key] = mean.item()
+                if std.item() > 1e-5:
+                    row[f"d_{key}"] = std.item()
+            elif isinstance(value, torch.Tensor):
+                row[key] = value.item()
             else:
-                row[key] = rows 
-               
+                row[key] = value
+        return row
 
+    def table(self, metrics):
+        row = self._reduce(metrics)
+        sorted_keys = self._sorted_keys(row.keys())
+        colors = cycle([c.value for c in Ansi if c != Ansi.ENDC])
 
-
+        headers, formatted = [], []
         for key, color in zip(sorted_keys, colors):
-            formatted = self.format_row(row, key, color=color)
-            if key.startswith('event_'):
-                key = key[6:]
-            yield key, formatted
-
-    def table(self, history):
-        headers = []
-        formatted = []
-        for key, formatted_row in self._yield_keys_formatted(history):
-            headers.append(key)
-            formatted.append(formatted_row)
+            cell = self.format_row(row, key, color=color)
+            header = key[6:] if key.startswith('event_') else key
+            headers.append(header)
+            formatted.append(cell)
 
         return tabulate(
             [formatted],
@@ -194,10 +157,9 @@ class PrintLog(Callback):
         if (self.sink is not print) or verbose:
             self.sink(text)
 
-    # pylint: disable=unused-argument
-    def on_epoch_end(self, state, history, **kwargs):
-        verbose = kwargs.get("verbose", True)
-        tabulated = self.table(history)
+    def __call__(self, metrics=None, *, verbose=True, **kw):
+        metrics = {**(metrics or {}), **kw}
+        tabulated = self.table(metrics)
 
         if self.first_iteration_:
             header, lines = tabulated.split('\n', 2)[:2]
@@ -208,87 +170,3 @@ class PrintLog(Callback):
         self._sink(tabulated.rsplit('\n', 1)[-1], verbose)
         if self.sink is print:
             sys.stdout.flush()
-
-class ProgressBar(Callback):
-    """Display a progress bar for each epoch.
-    """
-    def __init__(
-            self,
-            batches_per_epoch='auto',
-            detect_notebook=True,
-            postfix_keys=None
-    ):
-        self.batches_per_epoch = batches_per_epoch
-        self.detect_notebook = detect_notebook
-        self.postfix_keys = postfix_keys or ['train_loss', 'valid_loss']
-
-    def in_ipynb(self):
-        try:
-            return get_ipython().__class__.__name__ == 'ZMQInteractiveShell'
-        except NameError:
-            return False
-
-    def _use_notebook(self):
-        return self.in_ipynb() if self.detect_notebook else False
-
-    def _get_batch_size(self, net, training):
-        name = 'iterator_train' if training else 'iterator_valid'
-        net_params = net.get_params()
-        #print(net_params)
-        #print(hasattr(net, "batch_size"))
-        return net_params.get(name + '__batch_size', net_params['batch_size'])
-
-    def _get_batches_per_epoch_phase(self, net, dataset, training):
-        if dataset is None:
-            return 0
-        batch_size = self._get_batch_size(net, training)
-        return int(np.ceil(len(dataset) / batch_size))
-
-    def _get_batches_per_epoch(self, net, dataset_train, dataset_valid):
-        return (self._get_batches_per_epoch_phase(net, dataset_train, True) +
-                self._get_batches_per_epoch_phase(net, dataset_valid, False))
-
-    def _get_postfix_dict(self, net):
-        postfix = {}
-        for key in self.postfix_keys:
-            try:
-                postfix[key] = net.history[-1, 'batches', -1, key]
-            except KeyError:
-                pass
-        return postfix
-
-    # pylint: disable=attribute-defined-outside-init
-    def on_batch_end(self, net, **kwargs):
-        self.pbar_.set_postfix(self._get_postfix_dict(net), refresh=False)
-        self.pbar_.update()
-
-    # pylint: disable=attribute-defined-outside-init, arguments-differ
-    def on_epoch_begin(self, net, dataset_train=None, dataset_valid=None, **kwargs):
-        # Assume it is a number until proven otherwise.
-        batches_per_epoch = self.batches_per_epoch
-
-        if self.batches_per_epoch == 'auto':
-            batches_per_epoch = self._get_batches_per_epoch(
-                net, dataset_train, dataset_valid
-            )
-        elif self.batches_per_epoch == 'count':
-            if history.num_epochs <= 1:
-                # No limit is known until the end of the first epoch.
-                batches_per_epoch = None
-            else:
-                batches_per_epoch = history["batches"]["ibatch"][-1]
-
-        if self._use_notebook():
-            self.pbar_ = tqdm.tqdm_notebook(total=batches_per_epoch, leave=False)
-        else:
-            self.pbar_ = tqdm.tqdm(total=batches_per_epoch, leave=False)
-
-    def on_epoch_end(self, net, **kwargs):
-        self.pbar_.close()
-
-    def __getstate__(self):
-        # don't save away the temporary pbar_ object which gets created on
-        # epoch begin anew anyway. This avoids pickling errors with tqdm.
-        state = self.__dict__.copy()
-        state.pop('pbar_', None)
-        return state

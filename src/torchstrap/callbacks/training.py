@@ -1,280 +1,347 @@
+import shutil
 import os
-import pickle
-import warnings
+from pathlib import Path
 from contextlib import suppress
-from copy import deepcopy
-
-from beartype.typing import Callable
+from beartype.typing import Callable, Optional, Self
 
 import torch
 
-from torchstrap.callbacks import Callback
-from torchstrap.utils import noop, _check_f_arguments, open_file_like
-from torchstrap.utils.typing import BoolVector
+from torchstrap.state import State
+from torchstrap.history import History
 
-class Checkpoint(Callback):
-    """Save the model during training if the given metric improved.
+
+__all__ = ["Snapshot", "Checkpoint", "EarlyStopping"]
+
+
+class Snapshot:
+    """CPU-resident mirror of the whole ensemble `State` (a frozen ``TensorClass``).
+
+    Holds one CPU `State` (`self._snap`) shaped exactly like the live state
+    (`batch_size=[N]`) and supports masked per-replica row update/restore via a
+    single bulk device<->host transfer of just the affected rows — `state[idx]`
+    gathers/assigns whole replica rows across every leaf at once. `frozen` permits
+    these masked-row `__setitem__`s (in-place index_copy) while forbidding field
+    rebinding.
+
+    The per-epoch best-row D2H is **pinned + asynchronous**: improved rows are
+    gathered on device, copied non-blocking into a reused pinned staging buffer,
+    then a single stream sync materializes them before the host-side scatter into
+    the mirror — the same pin -> non_blocking -> one-sync discipline as
+    ``History.flush_epoch`` (~2x D2H bandwidth vs pageable). Note: TensorClass
+    *fancy* indexing returns a **copy**, so the async copy must land in the
+    **plain leading slice** ``staging[:k]`` (a real view); only the in-place
+    ``__setitem__`` scatters back into ``_snap``.
     """
-    def __init__(
-            self,
-            monitor='valid_loss_best',
-            f_state='state_dict.pt',
-            f_history='history.json',
-            fn_prefix='',
-            root_dir="checkpoint",
-            event_name='event_cp',
-            sink=noop,
-            load_best=False,
-            verbose=True,
-            **kwargs,
+
+    def __init__(self, state: State):
+        # One bulk device->host transfer of the entire state into a CPU mirror.
+        # `.clone()` is load-bearing: on a CPU live state `.cpu()` is a no-op that
+        # would otherwise *alias* the live storage (mutations would leak in).
+        self._snap: State = state.detach().cpu().clone()
+        # Reused pinned (N, ...) buffer giving the async D2H a writable pinned
+        # destination; allocated lazily on the first CUDA update (never on CPU).
+        self._staging: Optional[State] = None
+
+    @torch.no_grad()
+    def update(
+        self,
+        state: State,
+        extra_mask: torch.Tensor | None = None,
+    ) -> bool:
+        """Copy the active (and ``extra_mask``-selected) replicas' rows from the
+        live state into the CPU mirror. **Mask-first early-out:** the `(N,)` mask
+        is brought to host first, and when no row improved the whole D2H is
+        skipped; otherwise only the improved rows are transferred (pinned + async
+        on CUDA). Returns whether any row was committed (host bool) so the caller
+        writes a file without its own extra sync.
+        """
+        mask = state.active_mask
+        assert mask is not None
+        if extra_mask is not None:
+            mask = mask & extra_mask.to(mask.device)
+
+        # Bring just the (N,) mask to host first (tiny; one sync on CUDA). On a
+        # no-improvement epoch this is the *only* transfer — the full-state D2H is
+        # skipped entirely.
+        mask_cpu = mask.to("cpu")
+        idx_cpu = mask_cpu.nonzero(as_tuple=False).flatten()
+        k = int(idx_cpu.numel())
+        if k == 0:
+            return False
+
+        idx_dev = idx_cpu.to(state.device)
+        gathered = state[idx_dev]  # (k, ...) on the live device
+        g_dev = gathered.device
+        if g_dev is not None and g_dev.type == "cuda":
+            if self._staging is None:
+                self._staging = self._snap.clone().pin_memory()
+            # Async D2H into the pinned staging slice-view, one sync, then a
+            # host->host masked scatter into the mirror.
+            self._staging[:k].copy_(gathered, non_blocking=True)  # type: ignore
+            torch.cuda.current_stream().synchronize()
+            self._snap[idx_cpu] = self._staging[:k]
+        else:
+            self._snap[idx_cpu] = gathered
+        return True
+
+    @torch.no_grad()
+    def restore_to_live(
+        self,
+        state: State,
+        mask: torch.Tensor | None = None,
+    ) -> None:
+        """Write the masked replicas' mirror rows back into the live device state.
+
+        Unlike `update`, restore is **not** gated by `active_mask`: the rows that
+        most need restoring at train-end are the *frozen* (inactive) replicas,
+        which kept training past their best epoch before being frozen. `mask`
+        names exactly the rows to restore; `mask=None` restores every replica
+        (one in-place whole-state copy that preserves the param-aliasing invariant).
+        """
+        if mask is None:
+            state.copy_(self._snap.to(state.device))  # type: ignore
+            return
+
+        mask_dev = torch.as_tensor(
+            mask, dtype=torch.bool, device=state.device
+        ).reshape(-1)
+        idx_dev = mask_dev.nonzero(as_tuple=False).flatten()
+        if idx_dev.numel() == 0:
+            return
+        idx_cpu = idx_dev.to("cpu")
+        # Masked-row assignment is an in-place index_copy across every leaf, so the
+        # live params keep their identity (and the forward dict views stay valid).
+        state[idx_dev] = self._snap[idx_cpu].to(state.device)
+
+    def to_file(
+        self,
+        root_dir_path: Path,
+        file_name: Optional[str] = None,
     ):
-        self.monitor = monitor
+        # TensorClass memmap directory (one contiguous, lazily-loadable checkpoint).
+        # Clear any prior target first so re-checkpointing overwrites cleanly.
+        target = Path(root_dir_path) / (file_name or "state_dict")
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+        target.mkdir(parents=True, exist_ok=True)
+        self._snap.memmap(str(target))
+
+    @classmethod
+    def from_file(
+        cls,
+        root_dir_path: Path,
+        file_name: Optional[str] = None,
+        **kwargs,
+    ) -> Self:
+        target = Path(root_dir_path) / (file_name or "state_dict")
+        inst = cls.__new__(cls)
+        inst._snap = State.load_memmap(str(target))
+        inst._staging = None
+        return inst
+
+
+class Checkpoint:
+    """Save the ensemble's best-so-far replica rows when a monitored score improves.
+
+    A plain callable: ``ckpt(state, score)`` compares the per-replica ``(N,)``
+    score against the best seen so far, snapshots the **improved** rows into a CPU
+    ``Snapshot`` (gated by ``active_mask``), and — if any row improved — writes the
+    memmap checkpoint dir (and the optional ``history`` JSON). Returns the ``(N,)``
+    bool improved mask. ``load_best(state)`` reloads the saved snapshot and
+    restores every row back into the live state (e.g. after training).
+    """
+
+    def __init__(
+        self,
+        lower_is_better: bool = True,
+        root_dir: str | os.PathLike = "checkpoint",
+        f_state: str = "state_dict",
+        f_history: str = "history.json",
+        fn_prefix: str = "",
+        sink: Callable = print,
+        verbose: bool = True,
+    ):
+        self.lower_is_better = lower_is_better
+        self.root_dir = Path(root_dir)
         self.f_state = f_state
         self.f_history = f_history
         self.fn_prefix = fn_prefix
-        self.root_dir = root_dir
-        self.event_name = event_name
         self.sink = sink
-        self.load_best = load_best
         self.verbose = verbose
+        self._snapshot: Optional[Snapshot] = None
+        self._best: Optional[torch.Tensor] = None  # (N,) best score so far (host)
 
-    def initialize(self):
-        if not os.path.exists(self.root_dir):
-            os.makedirs(self.root_dir, exist_ok=True)
-        return self
+    @torch.no_grad()
+    def __call__(self, state, score, history: Optional[History] = None):
+        score_cpu = torch.as_tensor(score).detach().to("cpu").reshape(-1).float()
+        if self._best is None:
+            fill = float("inf") if self.lower_is_better else float("-inf")
+            self._best = torch.full_like(score_cpu, fill)
+        best = self._best
 
-    def on_train_end(self, state, history, **kwargs):
-        if not self.load_best or self.monitor is None:
-            return
-        self._sink(
-            "Loading best checkpoint after training.", 
-            self.verbose,
-        )
+        improved = score_cpu.lt(best) if self.lower_is_better else score_cpu.gt(best)
+        self._best = torch.where(improved, score_cpu, best)
 
-        state.from_file(self.root_dir, self.fn_prefix + self.f_state)
-        history.from_file(os.path.join(self.root_dir, self.fn_prefix + self.f_history))
+        if self._snapshot is None:
+            self._snapshot = Snapshot(state)
+        any_improved = self._snapshot.update(state, improved.to(state.device))
 
-
-    def on_epoch_end(self, state, history, **kwargs):
-        if f"{self.monitor}_best" in history:
-            warnings.warn(
-                f"Checkpoint monitor parameter is set to '{self.monitor}' and the history "
-                f"contains '{self.monitor}_best'. Perhaps you meant to set the parameter "
-                f"to '{self.monitor}_best'", UserWarning,
+        if any_improved:
+            self.root_dir.mkdir(parents=True, exist_ok=True)
+            self._snapshot.to_file(self.root_dir, self.fn_prefix + self.f_state)
+            if history is not None:
+                history.to_file(self.root_dir / (self.fn_prefix + self.f_history))
+            self._sink(
+                f"Checkpoint saved ({int(improved.sum())} replica(s) improved).",
+                self.verbose,
             )
+        return improved
 
-        if self.monitor is None:
-            do_checkpoint_list : list[bool] = state.model_status_list
-        elif callable(self.monitor):
-            do_checkpoint_list : list[bool] = self.monitor(state, history, **kwargs)
-        else:
-            try:
-                do_checkpoint : BoolVector = history[self.monitor][-1]
-                do_checkpoint_list : list[bool] = do_checkpoint.tolist()
-                do_checkpoint_list[:] = [
-                    do_chk and is_active 
-                    for do_chk, is_active in zip(
-                        do_checkpoint_list, state.model_status_list
-                    )
-                ]
-            except KeyError as e:
-                msg = (
-                    f"{e.args[0]} Make sure you have validation data if you use "
-                    "validation scores for checkpointing."
+    @torch.no_grad()
+    def load_best(self, state, history: Optional[History] = None) -> None:
+        with suppress(FileNotFoundError):
+            snap = Snapshot.from_file(self.root_dir, self.fn_prefix + self.f_state)
+            snap.restore_to_live(state)
+            self._sink("Loaded best checkpoint.", self.verbose)
+        if history is not None:
+            with suppress(FileNotFoundError):
+                loaded = History.from_file(
+                    self.root_dir / (self.fn_prefix + self.f_history)
                 )
-                raise Exception(msg)
-
-        if self.event_name is not None:
-            history.append(
-                self.event_name, torch.any(do_checkpoint).item()
-            )
-
-        history.to_file(
-            os.path.join(self.root_dir, self.fn_prefix+self.f_history)
-        )
-
-        for imodel, do_chk in enumerate(do_checkpoint_list):
-            if do_chk:
-                state[imodel].to_file(
-                    os.path.join(self.root_dir, f"replica_{imodel}"), 
-                    self.fn_prefix+self.f_state,
-                )
-                self._sink(
-                    f"A checkpoint was triggered in epoch {history.num_epochs}.", 
-                    self.verbose,
-                )
+                history.clear()
+                history.update(loaded)
 
     def _sink(self, text, verbose):
-        #  We do not want to be affected by verbosity if sink is not print
         if (self.sink is not print) or verbose:
             self.sink(text)
 
-class LoadInitState(Callback):
-    """Loads the model, optimizer, and history from a checkpoint into a
-    :class:`.NeuralNet` when training begins.
+
+class EarlyStopping:
+    """Freeze replicas whose monitored score stops improving; stop when all freeze.
+
+    A plain callable: ``stop = early(state, score)`` per epoch. Each replica keeps
+    its own miss counter; when a replica's ``(N,)`` score fails to beat its dynamic
+    threshold for ``patience`` epochs it is **frozen in place** via
+    ``state.active_mask[i] = False`` (the fused optimizer / LR scheduler then skip
+    it). Returns ``True`` once **every** replica is frozen, so the caller can
+    ``break``. With ``track_best`` the best-so-far weights are snapshotted and
+    ``restore_best(state)`` writes them back at the end.
+
+    Counting, thresholds and freezing are vectorized over the ensemble and gated by
+    ``active_mask`` (a frozen replica's counters/threshold hold).
     """
-    def __init__(self, checkpoint):
-        self.checkpoint = checkpoint
 
-    def initialize(self):
-        self.did_load_ = False
-        return self
-
-    def on_train_begin(
-        self, state, history, **kwargs,
-    ):
-        if not self.did_load_:
-            self.did_load_ = True
-            with suppress(FileNotFoundError):
-                if isinstance(self.checkpoint, TrainEndCheckpoint):
-                    pass # TODO : implement!
-                else:
-                    pass 
-                    
-class TrainEndCheckpoint(Callback):
-    """Saves the model parameters, optimizer state, and history at the end of
-    training. The default ``fn_prefix`` is ``'train_end_'``.
-    """
-    def __init__(
-            self,
-            f_state='state_dict.pt',
-            f_history='history.json',
-            fn_prefix='train_end_',
-            root_dir='',
-            sink=noop,
-            verbose=True,
-            **kwargs
-    ):
-        self.f_state = f_state 
-        self.f_history = f_history
-        self.fn_prefix = fn_prefix
-        self.root_dir = root_dir
-        self.verbose = verbose
-        self.sink = sink
-
-    def initialize(self):
-        self.checkpoint_ = Checkpoint(
-            monitor=None,
-            f_state = self.f_state,
-            f_history = self.f_history,
-            fn_prefix=self.fn_prefix,
-            root_dir=self.root_dir,
-            event_name=None,
-            sink=self.sink,
-        )
-        self.checkpoint_.initialize()
-        return self
-
-    def on_train_end(self, state, history, **kwargs):
-        self.checkpoint_.on_train_end(state, history, **kwargs)
-        self.checkpoint_._sink("Final checkpoint triggered", self.verbose)
-        return self
-
-class EarlyStopping(Callback):
-    """Callback for stopping training when scores don't improve.
-    """
     def __init__(
         self,
-        monitor='valid_loss',
-        patience=5,
-        threshold=1e-4,
-        threshold_mode='rel',
-        lower_is_better=True,
-        sink=print,
-        load_best=True,
-        verbose=True,
+        patience: int = 5,
+        threshold: float = 1e-4,
+        threshold_mode: str = "rel",
+        lower_is_better: bool = True,
+        track_best: bool = True,
+        sink: Callable = print,
+        verbose: bool = True,
     ):
-        self.monitor = monitor
-        self.lower_is_better = lower_is_better
+        if threshold_mode not in ("rel", "abs"):
+            raise ValueError(f"Invalid threshold mode: '{threshold_mode}'")
         self.patience = patience
         self.threshold = threshold
         self.threshold_mode = threshold_mode
-        self.misses_ = 0
-        self.dynamic_threshold_ = None
-        self.sink : Callable = sink
-        self.load_best = load_best
+        self.lower_is_better = lower_is_better
+        self.track_best = track_best
+        self.sink = sink
         self.verbose = verbose
+        self.misses_: Optional[torch.Tensor] = None
+        self.dynamic_threshold_: Optional[torch.Tensor] = None
+        self.best_weights_: Optional[Snapshot] = None
+        self.best_epoch_: Optional[torch.Tensor] = None
+        self._epoch = 0
 
-    def __getstate__(self):
-        # Avoids to save the module_ weights twice when pickling
-        state = self.__dict__.copy()
-        state['best_model_weights_'].clear()
-        return state
+    @torch.no_grad()
+    def __call__(self, state, score) -> bool:
+        score_cpu = torch.as_tensor(score).detach().to("cpu").reshape(-1).float()
+        n = score_cpu.shape[0]
+        if self.misses_ is None:
+            worst = float("inf") if self.lower_is_better else float("-inf")
+            self.misses_ = torch.zeros(n, dtype=torch.int)
+            self.dynamic_threshold_ = torch.full((n,), worst)
+            self.best_weights_ = Snapshot(state) if self.track_best else None
+            self.best_epoch_ = torch.zeros(n, dtype=torch.int)
+        assert self.dynamic_threshold_ is not None and self.best_epoch_ is not None
 
-    # pylint: disable=arguments-differ
-    def on_train_begin(self, state, history, **kwargs):
-        if self.threshold_mode not in ['rel', 'abs']:
-            raise ValueError(
-                f"Invalid threshold mode: '{self.threshold_mode}'"
+        active_cpu = state.active_mask.detach().to("cpu").reshape(-1)
+        improved = self._is_score_improved(score_cpu).logical_and_(active_cpu)
+
+        # Advance miss counters / threshold for active replicas only (frozen hold).
+        zeros = torch.zeros_like(self.misses_)
+        new_misses = torch.where(improved, zeros, self.misses_ + 1)
+        self.misses_ = torch.where(active_cpu, new_misses, self.misses_)
+        new_threshold = self._calc_new_threshold(score_cpu, improved)
+        self.dynamic_threshold_ = torch.where(
+            active_cpu, new_threshold, self.dynamic_threshold_
+        )
+        self.best_epoch_[improved] = self._epoch
+        if self.best_weights_ is not None:
+            self.best_weights_.update(state, improved.to(state.device))
+
+        # Vectorized freeze: active replicas whose miss count just hit `patience`.
+        newly_stopped = (self.misses_ >= self.patience) & active_cpu
+        if bool(newly_stopped.any()):
+            state.active_mask[newly_stopped.to(state.active_mask.device)] = False
+            for i in newly_stopped.nonzero(as_tuple=False).flatten().tolist():
+                self._sink(
+                    f"Freezing replica {i}: score has not improved in the last "
+                    f"{self.patience} epochs.",
+                    self.verbose,
+                )
+
+        self._epoch += 1
+        remaining = active_cpu & (~newly_stopped)
+        all_stopped = not bool(remaining.any())
+        if all_stopped:
+            self._sink(
+                "Stopping: no replica's score improved in the last "
+                f"{self.patience} epochs.",
+                self.verbose,
             )
-        self.misses_ = torch.zeros(state.num_replicas, dtype=torch.int) 
-        self.dynamic_threshold_ = float("inf") if self.lower_is_better else float("-inf")
-        self.best_model_weights_ = [None]*state.num_replicas
-        self.best_epoch_ = torch.zeros(state.num_replicas, dtype=torch.int)
+        return all_stopped
 
-    def on_epoch_end(self, state, history, **kwargs):
-        current_score = history[self.monitor][-1]
-        is_model_active = torch.as_tensor(state.model_status_list)
-        is_score_improved = self._is_score_improved(current_score).logical_and_(is_model_active)
-        self.misses_ = torch.where(is_score_improved, 0, self.misses_+1)
-        self.dynamic_threshold_ = self._calc_new_threshold(current_score, is_score_improved)
-        self.best_epoch_[is_score_improved] = history["iepoch"][-1]
-        if self.load_best:
-            for imodel, is_best in enumerate(is_score_improved.tolist()):
-                if is_best:
-                    self.best_model_weights_[imodel] = deepcopy(state[imodel].state_dict())
+    @torch.no_grad()
+    def restore_best(self, state) -> None:
+        if self.best_weights_ is None or self.best_epoch_ is None:
+            return
+        last_epoch = self._epoch - 1
+        restore_mask = self.best_epoch_ != last_epoch
+        self.best_weights_.restore_to_live(state, restore_mask)
+        for i in restore_mask.nonzero(as_tuple=False).flatten().tolist():
+            self._sink(
+                f"Restoring replica {i} to its best epoch "
+                f"{int(self.best_epoch_[i])}.",
+                self.verbose,
+            )
 
-        for i, misses in enumerate(self.misses_.tolist()):
-            if misses == self.patience:
-                state.mask_model(i) 
-                if self.verbose:
-                    self._sink(
-                    f"Stopping module {i} since {self.monitor} has not "
-                        f"improved in the last {self.patience} epochs.", 
-                        verbose=self.verbose
-                    )
-                if not any(state.model_status_list):
-                    self._sink(f"Stopping since {self.monitor} has not improved in the last "
-                           f"{self.patience} epochs for any module.",
-                           verbose=self.verbose)
-                    raise KeyboardInterrupt
-
-
-    def on_train_end(self, state, history, **kwargs):
-        if self.load_best:
-            for imodel in range(state.num_replicas):
-                if (
-                    (self.best_epoch_[imodel] != history["iepoch"][-1]) and \
-                    (self.best_model_weights_[imodel] is not None)
-                ):
-                    state[imodel].load_state_dict(
-                        self.best_model_weights_[imodel]
-                    ) 
-                    self._sink(
-                        f"Restoring best version of model {imodel} from epoch {self.best_epoch_[imodel]}.", 
-                        verbose=self.verbose
-                    )
-
-
-    def _is_score_improved(self, score : torch.Tensor) -> torch.Tensor:
+    def _is_score_improved(self, score: torch.Tensor) -> torch.Tensor:
+        threshold = self.dynamic_threshold_
+        assert threshold is not None
         if self.lower_is_better:
-            return score.lt(self.dynamic_threshold_)
-        return score.gt(self.dynamic_threshold_)
+            return score.lt(threshold)
+        return score.gt(threshold)
 
-    def _calc_new_threshold(self, score : torch.Tensor, is_improved : torch.Tensor) -> torch.Tensor:
-        """Determine threshold based on score."""
-        if self.threshold_mode == 'rel':
-            abs_threshold_change = torch.where(is_improved, self.threshold * score, 0) 
+    def _calc_new_threshold(
+        self, score: torch.Tensor, is_improved: torch.Tensor
+    ) -> torch.Tensor:
+        """Determine the new per-replica threshold from the score."""
+        if self.threshold_mode == "rel":
+            abs_threshold_change = torch.where(is_improved, self.threshold * score, 0.0)
         else:
-            abs_threshold_change = torch.where(is_improved, self.threshold, 0)
+            abs_threshold_change = torch.where(
+                is_improved, torch.full_like(score, self.threshold), 0.0
+            )
         if self.lower_is_better:
-            new_threshold = score - abs_threshold_change
-        else:
-            new_threshold = score + abs_threshold_change
-        return new_threshold
+            return score - abs_threshold_change
+        return score + abs_threshold_change
 
     def _sink(self, text, verbose):
-        #  We do not want to be affected by verbosity if sink is not print
         if (self.sink is not print) or verbose:
             self.sink(text)
-

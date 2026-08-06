@@ -1,125 +1,124 @@
 import json
-
-import pickle
 from collections import defaultdict
-from functools import partial
 
-from beartype.typing import Any, Callable, Optional
-from beartype.door import is_bearable
+from beartype.typing import Any
 
-from optree import register_pytree_node_class
-from optree import tree_structure, tree_transpose, tree_transpose_map, tree_map
-from optree import tree_flatten_one_level, tree_flatten, tree_unflatten
-from optree import treespec_one_level, treespec_list, treespec_leaf
-
+import torch
 from torch import Tensor
 
 from torchstrap.utils import open_file_like
 
-MISSING = object()
-
-def untensor(x):
-    if is_bearable(x, Tensor):
-        return x.tolist()
-    return x
 
 def list_list() -> list[list[Any]]:
+    """Seed for a fresh batch-metric key: a list-of-lists-by-epoch with one
+    (empty) epoch slot."""
     return [[]]
 
-dict_list = partial(defaultdict, list)
 
-def is_list(x):
-    return is_bearable(x, hint=list)
+def _untensor(obj):
+    """Recursively convert a nested dict/list structure into JSON-serializable
+    Python, turning any ``Tensor`` leaf into a (nested) list. Replaces the old
+    optree ``tree_map(untensor, ...)`` so ``history.py`` carries no pytree deps."""
+    if isinstance(obj, Tensor):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _untensor(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_untensor(v) for v in obj]
+    return obj
 
-@register_pytree_node_class(namespace="torchstrap.history")
+
 class History(defaultdict):
+    """Host-side training-metrics log.
+
+    Epoch-level metrics are flat lists keyed by name; batch-level metrics live
+    under a nested ``"batches"`` dict shaped as list-of-lists-by-epoch. The
+    stored record is **always host-resident**: device metric tensors handed to
+    ``append_batch`` during an epoch are held in a transient device queue and
+    drained to host in one bulk transfer by ``flush_epoch`` — call it once per
+    epoch (the manual training loop drives it) so any host-side reader sees host
+    tensors. Net: one device->host sync per epoch, never per batch.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # default_factory=None; key creation is handled by __missing__ below.
+        super().__init__(None, *args, **kwargs)
+        # Transient, per-epoch staging for (possibly on-device) batch metrics.
+        # An instance attribute, NOT a dict key, so it is never serialized.
+        self._batch_queue: dict[str, list[Tensor]] = {}
+
     @property
     def num_epochs(self) -> int:
         return len(self.get("iepoch", []))
 
-    @property
-    def num_batches(self) -> int:
-        return len(self["batches"].get("ibatch", [[]])[-1])
-
     def new_epoch(self):
-        self["iepoch"].append(self.num_epochs+1)
+        self["iepoch"].append(self.num_epochs + 1)
         for key in self["batches"].keys():
             self["batches"][key].append([])
-        
-    def append(self, key : str, val : Any):
+
+    def append(self, key: str, val: Any):
         self[key].append(val)
-    
-    def extend(self, key : str, val : list):
-        self[key].extend(val)
 
     def new_batch(self):
-        self["batches"]["ibatch"][-1].append(self.num_batches+1)
+        ibatch = self["batches"]["ibatch"][-1]
+        ibatch.append(len(ibatch) + 1)
 
-    def append_batch(self, key : str, val : Any):
-        self["batches"][key][-1].append(val)
+    def append_batch(self, key: str, val: Any):
+        # Stage the (possibly on-device) value; flush_epoch drains it to host.
+        self._batch_queue.setdefault(key, []).append(val)
 
-    def extend_batch(self, key : str, val : list):
-        self["batches"][key][-1].extend(val)
+    def flush_epoch(self):
+        """Drain this epoch's queued batch metrics to host and append them to the
+        record. Each key's per-batch values are stacked and copied device->host
+        non-blocking (into pinned memory), then a single stream sync materializes
+        the whole epoch at once — one device->host sync per epoch, overlapping
+        copies, and a record that is provably host-only afterwards."""
+        if not self._batch_queue:
+            return
 
-    def row_slice(self, ie : int | slice, ib : int | slice | None =  None):
-        row = {k : v[ie] for k, v in self.items()}
+        iepoch = self.num_epochs
+        batches = self["batches"]
 
-        ib =  ib if isinstance(ib, slice) else slice(ib)
-        if isinstance(ie, slice):
-            for key, epochs in row["batches"].items():
-                for epoch, batch in enumerate(epochs):
-                    row["batches"][key][epoch] = batch[ib]
+        issued_async = False
+        pending: list[tuple[str, Tensor]] = []
+        for key, vals in self._batch_queue.items():
+            stacked = torch.stack(vals)
+            if stacked.is_cuda:
+                host = torch.empty(
+                    stacked.shape, dtype=stacked.dtype,
+                    device="cpu", pin_memory=True,
+                )
+                host.copy_(stacked, non_blocking=True)
+                issued_async = True
+            else:
+                host = stacked
+            pending.append((key, host))
 
-        row["batches"] = {k : v[ib] for k, v in row["batches"].items()}
+        if issued_async:
+            torch.cuda.current_stream().synchronize()
 
-        return row
+        for key, host in pending:
+            slots = batches[key]
+            # Align to the current epoch (pad earlier epochs for a late-appearing
+            # key), then fill this epoch's slot with the per-batch host tensors.
+            while len(slots) < iepoch:
+                slots.append([])
+            slots[iepoch - 1] = list(host.unbind(0))
 
-    def __getitem__(self, index : int | str | slice):
-        if isinstance(index, str):
-            return super().__getitem__(index)
-        else:
-            return self.row_slice(index)
+        self._batch_queue = {}
 
-    def to_defaultdict(self):
-        return dict_list(self)
-    
     def to_dict(self):
-        res =  dict(**self)
-        res["batches"] = dict(**res["batches"])
-
-        return tree_map(untensor, res) 
+        return _untensor(dict(self))
 
     def to_file(self, f):
         with open_file_like(f, "w") as fp:
             json.dump(self.to_dict(), fp, indent=4)
-    
+
     @classmethod
     def from_file(cls, f):
-        with open_file_like(f, 'r') as fp:
+        with open_file_like(f, "r") as fp:
             return cls(json.load(fp))
 
-    def to_list(self, func: Optional[Callable]=None):
-        return tree_transpose_map(
-            func or (lambda x: x), self, 
-            inner_treespec=treespec_list([treespec_leaf()]*self.num_epochs), 
-            is_leaf = is_list, 
-            namespace="torchstrap.history",
-        )
-
     def __missing__(self, key):
-        self[key] = list() if key != "batches" else defaultdict(list_list)
-        if self.num_epochs > 1:
-            self[key].extend([MISSING for _ in range(self.num_epochs - 1)])
+        self[key] = defaultdict(list_list) if key == "batches" else []
         return self[key]
-    
-    def __tree_flatten__(self):
-        children, metadata = tree_flatten(
-            dict_list(self), is_leaf=is_list,
-        )
-        return children, metadata, None
-
-    @classmethod
-    def __tree_unflatten__(cls, metadata, children):
-        return tree_unflatten(metadata, children)
-
-

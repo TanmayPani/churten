@@ -1,460 +1,292 @@
-import os
-from functools import partial
-from typing import Optional, Any, Self, Callable
-from collections import OrderedDict
-from collections.abc import Iterator
-import dataclasses
+from numbers import Number
+from dataclasses import field
+from typing import Optional, Self, Any
+from collections import defaultdict
+from collections.abc import Sequence
+
+from plum import Dispatcher
 
 import torch
-from torch import Tensor, Size
+from torch.func import stack_module_state
+from torch.nn import Module, ModuleList
 
-from optree.dataclasses import dataclass, field, InitVar
+from tensordict import TensorDict, TensorClass, NonTensorData
 
-from optree import PyTree, PyTreeTypeVar, PyTreeSpec
-from optree import dict_insertion_ordered
-from optree import tree_transpose_map, tree_transpose_map_with_path 
-from optree import tree_flatten, tree_unflatten
-from optree import treespec_entries
+_dispatch = Dispatcher()
 
-from torchstrap.utils.typing import Vector 
-from torchstrap.callbacks import Checkpoint
+# Round the consolidated row width `T` up to a multiple of this.
+#
+# The fused kernels take ATen's vectorized `load_store` path only when
+# `n % kILP == 0` (kILP == 4) with `n = T - chunk_offset`. Every chunk offset is a
+# multiple of kChunkSize, so `n ≡ T (mod 4)` for every chunk of every row — a `T`
+# that is not a multiple of 4 puts the WHOLE ensemble on the ragged
+# element-by-element path, not just the last chunk. ATen cannot avoid this (it does
+# not own the allocation); we do, because we build the cat.
+#
+# 4 is the minimum that unlocks it, and it also satisfies the other half of ATen's
+# guard: with `T % 4 == 0` every row base `data_ptr + r*T` is 16-byte aligned, which
+# is what `is_aligned` checks (kILP * sizeof(float)).
+#
+# Measured at the spirals width (R=100, T=264705 → 264708), 4 reps: CUDA 3.443 →
+# 3.231 ms all-active and 870 → 820 µs at 75% frozen, i.e. +6.6%. CPU is unaffected
+# either way — its ragged tail is ≤7 elements out of 264705. 16 was also tried (to
+# cover `Vectorized<float>::size()` on AVX2/AVX512) and is consistently ~0.6% slower
+# on CUDA for no CPU gain, so it is not worth the extra padding.
+_CONSOLIDATION_ALIGNMENT = 4
 
-@dataclasses.dataclass
-class State:
-    param_dict : dict[str, Tensor]        
-    buffer_dict : dict[str, Tensor] 
-    optimizer_state : "OptimState"
-    batch_size : Size = dataclasses.field(default_factory=Size)
-    model_index_list : list[int] = dataclasses.field(default_factory=list)
-    model_status_list : list[bool] = dataclasses.field(default_factory=list)
-    extra_state : dict[str, Any] = dataclasses.field(default_factory=dict)
-    _state_list : list["State"] = dataclasses.field(default_factory=list, init=False)
+
+def _cat_consolidated(
+    flat: list[torch.Tensor],
+    batch_size: tuple | torch.Size,
+    device: str | torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Cat the flattened leaves into one `(*batch_size, T)` buffer.
+
+    `torch.cat([])` raises, so the (rare) param-less case and the (common)
+    buffer-less one get an empty `(N, 0)` storage that the offset-table views and
+    `functional_call` both handle trivially. An empty consolidation is deliberately
+    *not* padded — `(N, 0)` must stay `(N, 0)`.
+
+    The pad lanes are zero and stay zero for the lifetime of the state: the offset
+    table never covers them, so `_consolidated_grads.update_` never writes a gradient
+    there, and Adam on a zero param with a zero grad has a delta of exactly zero
+    (`exp_avg` stays 0, `denom` is `eps`), as does AdamW's `param *= 1 - lr*wd`.
+    """
+    if not flat:
+        return torch.empty((*batch_size, 0), device=device, dtype=dtype)
+
+    storage = torch.cat([t.to(device=device, dtype=dtype) for t in flat], dim=-1)
+    pad = -storage.shape[-1] % _CONSOLIDATION_ALIGNMENT
+    if pad:
+        storage = torch.cat(
+            [storage, torch.zeros((*batch_size, pad), device=device, dtype=dtype)],
+            dim=-1,
+        )
+    return storage
+
+
+def consolidate_params_and_bufffers_dict(
+    params_and_buffers_dict: tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]],
+    batch_size: Optional[tuple | torch.Size] = None,
+    device: Optional[str | torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+):
+    params_dict, buffers_dict = params_and_buffers_dict
+    device = device or next(iter(params_dict.values())).device
+    dtype = dtype or next(iter(params_dict.values())).dtype
+    batch_size = batch_size or ()
+    batch_dims = len(batch_size)
+
+    offset = 0
+    consolidated: dict[str, dict[str, Any]] = {
+        "params": {"metadata": []},
+        "buffers": {"metadata": []},
+    }
+
+    flat_params = []
+    for t_key, t_val in params_dict.items():
+        t_shape = t_val.shape
+        if t_shape[:batch_dims] != batch_size:
+            raise ValueError(
+                f"Tensor at key={t_key} has incompatible shape {t_shape} for batch size {batch_size}"
+            )
+
+        flat_params.append(t_val.view(*batch_size, -1))
+        num_elements = flat_params[-1].shape[-1]
+        consolidated["params"]["metadata"].append(
+            (t_key, t_shape, offset, num_elements)
+        )
+        offset += num_elements
+    consolidated["params"]["storage"] = _cat_consolidated(
+        flat_params, batch_size, device, dtype
+    )
+
+    offset = 0
+    flat_buffers = []
+    for t_key, t_val in buffers_dict.items():
+        t_shape = t_val.shape
+        if t_shape[:batch_dims] != batch_size:
+            raise ValueError(
+                f"Tensor at key={t_key} has incompatible shape {t_shape} for batch size {batch_size}"
+            )
+
+        flat_buffers.append(t_val.view(*batch_size, -1))
+        num_elements = flat_buffers[-1].shape[-1]
+        consolidated["buffers"]["metadata"].append(
+            (t_key, t_shape, offset, num_elements)
+        )
+        offset += num_elements
+
+    consolidated["buffers"]["storage"] = _cat_consolidated(
+        flat_buffers, batch_size, device, dtype
+    )
+
+    return consolidated
+
+
+def consolidated_dict_view(tcons: torch.Tensor, metadata: list[tuple]):
+    return {
+        key: tcons[..., offset : offset + num_elements].view(*shape)
+        for key, shape, offset, num_elements in metadata
+    }
+
+
+class State(TensorClass, frozen=True):  # type: ignore[call-arg]
+    # `params` / `buffers` are the consolidated, replica-major `(N, T)` flat buffers
+    # produced by `consolidate_params_and_bufffers_dict` (row i == replica i; `T` is
+    # rounded up to `_CONSOLIDATION_ALIGNMENT` so the fused kernels reach ATen's
+    # vectorized path, and the ≤3 pad lanes stay exactly zero — see that constant).
+    # The cat IS the source of truth — nothing is re-consolidated
+    # through tensordict — so per-replica `lr` / `active_mask` / freeze are exact.
+    # The per-name `(N, *shape)` views `functional_call` needs are rebuilt on demand
+    # from the offset tables (`param_meta` / `buffer_meta`) as *aliased* views into
+    # these buffers; writing through a view writes the consolidated buffer.
+    params: torch.Tensor
+    buffers: torch.Tensor
+    param_meta: Any
+    buffer_meta: Any
+    param_buffer_dtype: torch.dtype = field(default=torch.float32)
+    optimizer_state: TensorDict = field(default_factory=TensorDict)
+    active_mask: Optional[torch.Tensor] = None
+
+    # Consolidated `(N, T)` gradient buffer, laid out exactly like `params`.
+    # `apply_gradient` scatters the vmap'd per-name grad dict into it via
+    # `_consolidated_grads` (aliased views); `Adam.update` reads it back as
+    # `flat_grads`. Built in `__post_init__`; frozen forbids rebinding it but
+    # allows the in-place scatter.
+    grads: torch.Tensor = field(init=False)
+
+    @classmethod
+    def from_models(cls: type[Self], modules: Sequence[Module] | ModuleList) -> Self:
+        batch_size = (len(modules),)
+        consolidated = consolidate_params_and_bufffers_dict(
+            stack_module_state(modules), batch_size=batch_size
+        )
+        params = consolidated["params"]["storage"]
+        buffers = consolidated["buffers"]["storage"]
+
+        # The offset tables are *single* python objects (a list per buffer group),
+        # not per-replica data — wrap each as one NonTensorData so tensordict stores
+        # it opaquely instead of reading its length as a batch dim.
+        return cls(
+            params=params,
+            buffers=buffers,
+            param_meta=NonTensorData(consolidated["params"]["metadata"]),
+            buffer_meta=NonTensorData(consolidated["buffers"]["metadata"]),
+            param_buffer_dtype=params.dtype,
+            batch_size=batch_size,
+            device=params.device,
+        )
 
     def __post_init__(self):
-        # Aliasing invariant: param_dict[name] is the same Tensor object as
-        # optimizer_state.params[i] (from tree_flatten in OptimState._from_pytree),
-        # and per-replica views in _state_list are torch.unbind views of those
-        # same tensors. Optimizer kernels MUST mutate these tensors in place
-        # (.copy_ / .add_ / .index_copy_ / ...) and never reassign list entries,
-        # or the model params and the checkpointing views go out of sync.
-        if len(self.model_index_list) == 0:
-            self.model_index_list = list(range(self.num_replicas))
-            self.model_status_list = [True]*self.num_replicas
-
-        if self.num_replicas == 1:
-            self._state_list = [self]
-        else:
-            _unbind_fn = partial(torch.unbind, dim=0)
-            _param_dict_list = tree_transpose_map(
-                _unbind_fn, self.param_dict,
+        # frozen=True installs the dataclass guard as __setattr__, so `self.x = y`
+        # raises; the tensorclass isn't locked yet during the *initial* __post_init__,
+        # so set the init=False / defaulted fields through the tensorclass setter.
+        #
+        # Idempotency: tensorclass ops that reconstruct the instance (`.cpu()`,
+        # `.detach()`, `state[idx]`, `.clone()`, …) re-run __post_init__ on the
+        # already-built — and *locked* — result, where these fields are present.
+        # Only set when actually absent so reconstruction doesn't hit the lock.
+        if self.get("active_mask", None) is None:
+            self.set(
+                "active_mask",
+                torch.ones(self.batch_size, dtype=torch.bool, device=self.device),
             )
-            if len(self.buffer_dict) > 0:
-                _buffer_dict_list = tree_transpose_map(
-                    _unbind_fn, self.buffer_dict,
-                )
-            else:
-                _buffer_dict_list = [{}]*self.num_replicas
-            _optim_state_list = self.optimizer_state.unbind()
-            self._state_list = [
-                State(
-                    _params, 
-                    _buffers, 
-                    _optim_state, 
-                    model_index_list=[imodel], 
-                    model_status_list=[self.model_status_list[imodel]], 
-                    extra_state=self.extra_state,
-                ) for (
-                    imodel, 
-                    _params, 
-                    _buffers, 
-                    _optim_state,
-                ) in zip(
-                    self.model_index_list, 
-                    _param_dict_list, 
-                    _buffer_dict_list, 
-                    _optim_state_list,
-                )
-            ]
+        if self.get("grads", None) is None:
+            self.set("grads", torch.zeros_like(self.params))
 
-    def reset_status(self, full : bool = False) -> None:
-        for imodel in range(self.num_replicas):
-            self.model_status_list[imodel] = True
+    @property
+    def flat_params(self: Self) -> torch.Tensor:
+        return self.params
 
-        if full:
-            self.optimizer_state.reset()
-            
-    @classmethod
-    def from_stacked_params_and_buffers(
-        cls : type[Self],
-        params_and_buffers_dict : tuple[dict[str, Tensor], dict[str, Tensor]],
-        optimizer_state_cls : type["OptimState"],
-        /,
-        batch_size : tuple[int, ...],
-        **kwargs : Any, 
-    ) -> Self :
-        optimizer_state = optimizer_state_cls.from_param_dict(
-            params_and_buffers_dict[0], 
-            batch_size=batch_size, 
-            **kwargs,
+    @property
+    def flat_grads(self: Self) -> torch.Tensor:
+        return self.grads
+
+    @property
+    def params_dict(self: Self) -> dict[str, torch.Tensor]:
+        # Aliased `(N, *shape)` views into the consolidated `params` buffer, rebuilt
+        # each access (frozen forbids caching). Fed to `functional_call`.
+        return consolidated_dict_view(self.params, self.param_meta)
+
+    @property
+    def buffers_dict(self: Self) -> dict[str, torch.Tensor]:
+        return consolidated_dict_view(self.buffers, self.buffer_meta)
+
+    @property
+    def _consolidated_grads(self: Self) -> TensorDict:
+        # Aliased per-name views into the consolidated `grads` buffer. `apply_gradient`
+        # does `state._consolidated_grads.update_(grads)` to scatter the per-name grad
+        # dict in place; `flat_grads` then reads the populated `(N, T)` buffer back.
+        return TensorDict(
+            consolidated_dict_view(self.grads, self.param_meta),
+            batch_size=self.batch_size,
+            device=self.device,
         )
 
-        instance = cls(
-            param_dict = params_and_buffers_dict[0],
-            buffer_dict = params_and_buffers_dict[1],
-            optimizer_state = optimizer_state,
-            batch_size = torch.Size(batch_size),
-        )
-
-        return instance
-
-    @property
-    def num_replicas(self) -> int:
-        if len(self.optimizer_state.batch_size) == 0:
-            return 1
-        return self.optimizer_state.batch_size[0]
-
-    @property
-    def device(self) -> torch.device:
-        return next(iter(self.param_dict.values())).device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return next(iter(self.param_dict.values())).dtype
-
-    @property
-    def active_models(self) -> list[int]:
-        return [
-            imodel 
-            for imodel, status in zip(self.model_index_list, self.model_status_list) \
-            if status
-        ]
-
-    def mask_model(self, index : int):
-        self.model_status_list[index] = False
-
-    @property
-    def num_active_models(self) -> int:
-        return len(self.active_models)
-
-    def set_gradients(self, grads):
-        self.optimizer_state.gradients = grads
-
-    def __getitem__(self, index) -> Self:
-        return self._state_list[index]
-
-    def __len__(self) -> int:
-        return len(self._state_list)
-
-    def vmap_in_dims(self, args : Optional[tuple] = None):
-        if "in_dims" not in self.extra_state:
-            in_dim_params_and_buffers = (0, 0)
-            if args is not None:
-                in_dim_args = in_dim_params_and_buffers + tuple(
-                    0 if isinstance(arg, Tensor) else None for arg in args
-                )
-                self.extra_state["in_dims"] = in_dim_args
-            else:
-                self.extra_state["in_dims"] = in_dim_params_and_buffers
-
-        return self.extra_state["in_dims"]
-
-    def to_file(
-        self,
-        root_dir : Optional[str] = None, 
-        file_name : Optional[str] = None,
+    def add_optim_state(
+        self: Self, key: str, value: Any = None, per_param: bool = False
     ):
-        root_dir = root_dir or "checkpoint"
-        file_name = file_name or "state_dict.pt" 
-        if self.batch_size == ():
-            if not os.path.exists(root_dir):
-                os.makedirs(root_dir, exist_ok=True)
-            file_path = os.path.join(root_dir, file_name)
-            torch.save(
-                self.state_dict(), 
-                file_path,
+        # optimizer_state is a child of the frozen (locked) State graph, so adding a
+        # new entry (a structural change) requires unlocking the root first, then
+        # restoring the lock. Unlike the old tensordict-consolidate path, nothing is
+        # cached off the flat buffers, so no rebuild is needed inside the window.
+        value_t = self.like_tensor(value, per_param=per_param)
+        td = self._tensordict
+        was_locked = td.is_locked
+        if was_locked:
+            td.unlock_()
+        try:
+            self.optimizer_state[key] = value_t
+        finally:
+            if was_locked:
+                td.lock_()
+
+    def add_optim_meta(self: Self, key: str, value: Any):
+        # Store a STATIC (non-tensor) optimizer flag (e.g. amsgrad / maximize /
+        # decoupled_weight_decay) as a NonTensorData under optimizer_state — it is
+        # not per-replica and must not be tensorized by `like_tensor`. Same
+        # unlock/relock dance as add_optim_state (structural change to the frozen
+        # graph); NonTensorData auto-unwraps on read and rides through
+        # memmap / masked-select.
+        td = self._tensordict
+        was_locked = td.is_locked
+        if was_locked:
+            td.unlock_()
+        try:
+            self.optimizer_state[key] = NonTensorData(value)
+        finally:
+            if was_locked:
+                td.lock_()
+
+    @_dispatch
+    def like_tensor(self, value: None, per_param: bool = False):
+        if not per_param:
+            return torch.zeros(
+                self.batch_size,
+                dtype=self.param_buffer_dtype,
+                device=self.device,
             )
+        return torch.zeros_like(self.flat_params, memory_format=torch.preserve_format)
 
-        else:
-            for i in self.active_models:
-                dir_path = os.path.join(root_dir, f"replica_{i}")
-                self[i].to_file(dir_path, file_name)
-
-    def from_file(
-        self,
-        root_dir : Optional[str] = None, 
-        file_name : Optional[str] = None,
-        **kwargs,
-    ):
-        root_dir = root_dir or "checkpoint"
-        file_name = file_name or "state_dict.pt" 
-        if self.batch_size == ():
-            _state_dict = torch.load(
-                os.path.join(root_dir, file_name), 
-                map_location=kwargs.pop("map_location", "cpu"),
-                mmap=kwargs.pop("mmap", True),
-                weights_only=kwargs.pop("weights_only", True),
-                **kwargs,
+    @_dispatch
+    def like_tensor(self, value: int | float | complex, per_param: bool = False):
+        if not per_param:
+            return torch.full(
+                self.batch_size,
+                fill_value=value,
+                dtype=self.param_buffer_dtype,
+                device=self.device,
             )
-            self.load_state_dict(_state_dict)
-        else:
-            for i in self.active_models:
-                dir_path = os.path.join(root_dir, f"replica_{i}")
-                self[i].from_file(dir_path, file_name, **kwargs)
-       
-    def state_dict(self):
-        _state_dict = {}
-        if self.batch_size == ():
-            _state_dict["parameters"] = {}
-            for name, param in self.param_dict.items():
-                _state_dict["parameters"][name] = param.detach().cpu()
-            _state_dict["buffers"] = {}
-            for name, buffer in self.buffer_dict.items():
-                _state_dict["buffers"][name] = buffer.detach().cpu()
-            _state_dict["optimizer"] = self.optimizer_state.state_dict()
-        else:
-            for i in self.active_models:
-                _state_dict[f"replica_{i}"] = self[i].state_dict()
-        
-        _state_dict["metadata"] = {}
-        _state_dict["metadata"]["extra_state"] = self.extra_state
-        _state_dict["metadata"]["batch_size"] = self.batch_size
-        _state_dict["metadata"]["model_index_list"] = self.model_index_list
-        _state_dict["metadata"]["model_status_list"] = self.model_status_list
-        return _state_dict
-
-    @torch.no_grad()
-    def load_state_dict(self, state : dict[str, Any],):
-        if self.batch_size == ():
-            for name, param in self.param_dict.items():
-                param.copy_(state["parameters"][name])
-                del state["parameters"][name]
-
-            for name, buffer in self.buffer_dict.items():
-                buffer.copy_(state["buffers"][name])
-                del state["buffers"][name]
-
-            self.optimizer_state.load_state_dict(state["optimizer"])
-        else:
-            for i in self.active_models:
-                self[i].load_state_dict(state[f"model_{i}"])
-
-        #for iparam, param_name in enumerate(self.optimizer_state.param_names):
-        #    print(
-        #        iparam, 
-        #        param_name, 
-        #        self.param_dict[param_name].data_ptr(), 
-        #        self.optimizer_state.params[iparam].data_ptr(),
-        #        torch.allclose(self.param_dict[param_name], self.optimizer_state.params[iparam])
-        #    )
-
-        self.extra_state = state["metadata"]["extra_state"]
-        self.batch_size = state["metadata"]["batch_size"]
-        self.model_index_list = state["metadata"]["model_index_list"]
-        self.model_status_list = state["metadata"]["model_status_list"]
-
-@dataclass(namespace="torchstrap.state")
-class OptimState:
-    param_names    : list[str]    = field(default_factory=list, pytree_node=False)
-    batch_size     : Size         = field(default_factory=Size)
-    params         : list[Tensor] = field(default_factory=list)
-    state_steps    : list[Vector] = field(default_factory=list)
-    grads          : list[Tensor] = field(default_factory=list)
-    maximize       : bool         = field(default=False, pytree_node=False)
-    foreach        : bool         = field(default=False, pytree_node=False)
-    capturable     : bool         = field(default=False, pytree_node=False)
-    differentiable : bool         = field(default=False, pytree_node=False)
-    fused          : bool         = field(default=True , pytree_node=False)
-
-    def state_dict(self):
-        _state_dict = {}
-        for name, field in self.__dataclass_fields__.items():
-            if name in ["params", "grads"]:
-                continue
-            
-            val = getattr(self, name)
-            if field.type in [list[Tensor], list[Vector]]:
-                _state_dict[name] = [t.detach().cpu() for t in val]
-            elif field.type == Vector:
-                _state_dict[name] = val.detach().cpu()
-            else:
-                _state_dict[name] = val
-
-        return _state_dict
-
-
-    @torch.no_grad()
-    def load_state_dict(self, state):
-        for name, field in self.__dataclass_fields__.items():
-            if name in ["params", "grads"]:
-                continue
-
-            self_val = getattr(self, name)
-            if field.type in [list[Tensor], list[Vector]]:
-                for t_val, self_t_val in zip(state[name], self_val):
-                    self_t_val.copy_(t_val)
-            elif field.type == Vector:
-                self_val.copy_(state[name])
-            else:
-                setattr(self, name, state[name])
-
-            del state[name]
-
-    def reset(self):
-        for name, field in self.__dataclass_fields__.items():
-            if name in ["params", "grads"]:
-                continue 
-
-            if field.type in [list[Tensor], list[Vector]]:
-                for t in getattr(self, name):
-                    t.zero_()
-
-    def __post_init__(self):
-        _zeros = partial(
-            torch.zeros, 
-            device = self.params[0].device, 
-            dtype = torch.float32,
-        )
-        _zero_tensor = partial(
-            torch.tensor, 
-            0.0, 
-            device = self.params[0].device, 
-            dtype=torch.float32,
-        )
-        
-        if len(self.state_steps) == 0:
-            self.state_steps = [
-                _zeros(self.batch_size) if self.capturable or self.fused \
-                else _zero_tensor().repeat(self.batch_size) for p in self.params
-            ]
-
-        if len(self.grads) == 0:
-            self.gradients = None
-        
-        self.validate_fields()
-
-    def validate_fields(self):
-        _as_tensor = partial(
-            torch.as_tensor, 
-            device = self.params[0].device, 
-            dtype=torch.float32,
+        return torch.full_like(
+            self.flat_params, fill_value=value, memory_format=torch.preserve_format
         )
 
-        for name, field in self.__dataclass_fields__.items():
-            value = getattr(self, name)
-            if field.type == Vector:
-                value_tensor = _as_tensor(value).squeeze_()
-                if value_tensor.shape == self.batch_size:
-                    setattr(self, name, value_tensor)
-                elif value_tensor.numel() == 1:
-                    setattr(self, name, value_tensor.repeat(self.batch_size))
-                else:
-                    raise ValueError(
-                        f"Got tensor {value} with incompatible shape "
-                        f"{value_tensor.shape} for state  with shape {self.batch_size}"
-                    )
-                continue
-            
-            if field.type == list[Tensor] or field.type == list[Vector]:
-                if len(value) > 0 and len(value) != len(self.params):
-                    raise ValueError(
-                        f"Attribute {name} is supposed to be defined on a "
-                        f"per-parameter basis, but got {len(value)} {name} for "
-                        f"{len(self.params)} parameters."
-                    )
+    @_dispatch
+    def like_tensor(self, value: torch.Tensor, per_param: bool = False):
+        v = torch.as_tensor(value, dtype=self.param_buffer_dtype, device=self.device)
+        if not per_param:
+            return v.expand(self.batch_size).clone()
 
-            if field.type == list[Tensor]:
-                for t in value:
-                    if t.shape[:len(self.batch_size)] != self.batch_size:
-                        raise ValueError(
-                            f"Tensor from list {name} should have shape {self.batch_size} "
-                            f"along the first {len(self.batch_size)} dimensions, "
-                            f"but got {t.shape[:len(self.batch_size)]}"
-                        )
-                continue
-            
-            if field.type == list[Vector]:
-                for t in value:
-                    if t.shape != self.batch_size:
-                        raise ValueError(
-                            f"Vector from list {name} should have shape {self.batch_size} "
-                            f"but got tensor with shape {t.shape}"
-                        )
-                continue
-        
-    @property
-    def gradients(self):
-        return tree_unflatten(self.param_spec, self.grads)
-
-    @gradients.setter
-    def gradients(
-        self, 
-        grads : Optional[dict[str, Tensor]], 
-    ):
-        if grads is None:
-            if len(self.grads) == 0:
-                self.grads = [
-                    torch.zeros_like(
-                        p, memory_format=torch.preserve_format
-                    ) for p in self.params
-                ]
-            else:
-                glist = [g.zero_() for g in self.grads]
-        else:
-            glist = [
-                g.copy_(grads[param_name]) 
-                for g, param_name in zip(self.grads, self.param_names)
-            ]
-
-    @classmethod
-    def from_param_dict(
-        cls : type[Self], 
-        param_dict : dict[str, Tensor],
-        /,
-        batch_size : tuple | list,
-        **kwargs : Any,
-    ) -> Self:
-        raise NotImplementedError
-
-    @classmethod
-    def _from_pytree(
-        cls : type[Self], 
-        param_pytree : Any,
-        /,
-        batch_size : tuple | list,
-        **kwargs,
-    ) -> Self:
-        with dict_insertion_ordered(True, namespace="torchstrap.state"):
-            params, param_spec = tree_flatten(
-                param_pytree, namespace="torchstrap.state",
-            )
-        param_names = treespec_entries(param_spec)
-        for key, val in kwargs.items():
-            if key not in cls.__dataclass_fields__:
-                continue 
-            field = cls.__dataclass_fields__[key]
-            if field.type == Vector:
-                kwargs[key] = torch.as_tensor(
-                    val, device=params[0].device, dtype=torch.float32
-                )
-            
-        return cls(param_names=param_names, batch_size=torch.Size(batch_size), params=params, **kwargs)
-
-    def unbind_leaf(self, path, x):
-        if isinstance(x, Tensor):
-            return torch.unbind(x, 0)
-        elif path[0] == "batch_size":
-            return (torch.Size(),)*self.batch_size[0]
-        else:
-            return (x,)*self.batch_size[0]
-
-    def unbind(self):
-        if len(self.batch_size) == 0:
-            return [self]
-        
-        return tree_transpose_map_with_path(
-            self.unbind_leaf, 
-            self, 
-            none_is_leaf=True, 
-            namespace="torchstrap.state", 
-        )
-
+        return v.expand_as(self.flat_params).clone()

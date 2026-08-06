@@ -1,11 +1,19 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+# torchstrap._C, built in place by the editable install
+*.so
 build/
 dist/
 wheels/
 *.egg-info
 checkpoint
+
+# Example outputs (examples/*/out/)
+out/
+
+# Test runner
+.pytest_cache/
 
 # Unrelated files
 *.tar.gz

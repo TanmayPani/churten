@@ -1,73 +1,55 @@
-""" Callbacks for calculating scores."""
-
-from contextlib import contextmanager
-from contextlib import suppress
-from functools import partial
-import warnings
-
-import math
+"""Epoch-level score aggregation."""
 
 import torch
+from torch import Tensor
 
-from torchstrap.utils import to_numpy
-from torchstrap.utils import to_device
+from beartype.typing import Sequence
 
-from .callbacks import Callback
 
-__all__ = ["PassThroughScoring"]
+__all__ = ["EpochScore"]
 
-class PassThroughScoring(Callback):
-    """Creates scores on epoch level based on batch level scores
+
+class EpochScore:
+    """Aggregate per-batch ``(N,)`` scores into one ``(N,)`` epoch score.
+
+    A plain callable: collect each batch's per-replica score during the epoch
+    (e.g. ``batch_losses.append(loss.detach())``), then call this once at epoch
+    end. With ``batch_sizes`` the batches are weighted by their (per-replica)
+    sample count; without it they are averaged equally. The result is a ``(N,)``
+    tensor on the same device as the inputs — feed it straight to ``Checkpoint``,
+    ``EarlyStopping``, or ``LRScheduler``.
+
+    Stateless: best-so-far tracking lives in the consumers, not here.
     """
-    def __init__(
-            self,
-            name,
-            lower_is_better=True,
-            on_train=False,
-    ):
-        self.name = name
-        self.lower_is_better = lower_is_better
-        self.on_train = on_train
 
-    def initialize(self):
-        self.best_score_ = torch.tensor(float("inf")) if self.lower_is_better else torch.tensor(float("-inf"))
-        return self
+    def __call__(
+        self,
+        batch_values: Sequence[Tensor] | Tensor,
+        batch_sizes: Sequence[Tensor] | Sequence[int] | Tensor | None = None,
+    ) -> Tensor:
+        scores = (
+            batch_values
+            if isinstance(batch_values, Tensor)
+            else torch.stack(list(batch_values))
+        )  # (B, N)
+        if batch_sizes is None:
+            return scores.mean(dim=0)
 
-    def _is_best_score(self, current_score):
-        if self.lower_is_better is None:
-            return None
-        if self.lower_is_better:
-            return current_score.lt(self.best_score_)
-        return current_score.gt(self.best_score_)
-
-    def get_avg_score(self, history):
-        if self.on_train:
-            bs_key = 'train_batch_size'
+        # `batch_sizes` weights each batch. Two layouts are accepted:
+        #   * shared per-batch scalars -> `(B,)`/`(B,1)`, broadcast over replicas
+        #     (e.g. plain sample counts), or
+        #   * per-replica masses -> `(B, N)` (e.g. each batch's per-replica `sum(w)`),
+        #     which yields the EXACT per-replica weighted mean
+        #     `sum_b sum_i(w*score) / sum_b sum_i(w)` when the per-batch scores are
+        #     themselves per-replica weighted means.
+        if isinstance(batch_sizes, Tensor):
+            weights = batch_sizes
         else:
-            bs_key = 'valid_batch_size'
-
-        weights = history['batches'][bs_key][-1]
-        scores = history['batches'][self.name][-1]
-
-        stacked_scores = torch.stack(scores)
-        stacked_weights = torch.stack(weights).unsqueeze_(-1)
-
-
-        w_sum = stacked_weights.sum()
-        
-        wxs_sum = stacked_scores.mul_(stacked_weights).sum(0)
-
-        return wxs_sum.div_(w_sum)
-
-    # pylint: disable=unused-argument,arguments-differ
-    def on_epoch_end(self, state, history, **kwargs):
-        if len(history['batches'].get(self.name, [[]])[-1]) == 0:
-            return
-
-        score_avg = self.get_avg_score(history)
-        is_best = self._is_best_score(score_avg)
-        self.best_score_ = torch.where(is_best, score_avg, self.best_score_)
-        history.append(self.name, score_avg)
-        if is_best is not None:
-            history.append(self.name + '_best', is_best)
-
+            items = list(batch_sizes)
+            weights = (
+                torch.stack(items)
+                if items and isinstance(items[0], Tensor)
+                else torch.as_tensor(items, dtype=scores.dtype, device=scores.device)
+            )
+        weights = weights.reshape(scores.shape[0], -1).to(scores.dtype)  # (B,1) or (B,N)
+        return (scores * weights).sum(dim=0) / weights.sum(dim=0)

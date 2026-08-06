@@ -1,14 +1,16 @@
+import argparse
 from functools import partial
 from itertools import chain
 from math import pi
+from pathlib import Path
 
 from matplotlib import cm as cm
 from matplotlib import pyplot as plt
 from matplotlib.font_manager import FontProperties
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 
-import torch 
-from torch.func import vmap, functional_call
+import torch
+from torch.func import vmap, functional_call, grad_and_value
 from torch.nn import Sequential, Linear, ReLU
 from torch.nn.functional import binary_cross_entropy_with_logits, sigmoid
 
@@ -16,7 +18,9 @@ from torch.distributions import Categorical
 
 from torchstrap.stateless import StatelessModule
 from torchstrap.optimizer import Adam
-from torchstrap.callbacks import Checkpoint, EarlyStopping
+from torchstrap.callbacks import (
+    EpochScore, EpochTimer, PrintLog, LRScheduler, Checkpoint, EarlyStopping,
+)
 
 def make_spirals(n_samples, noise_std=0., rotations=1.):
     ts = torch.linspace(0, 1, n_samples)
@@ -78,14 +82,14 @@ def predict_fn(model, params, buffers, inputs):
 
 def predict_on_mesh(ensemble, state, width=1.5, steps=50):
     with torch.inference_mode():
+        n = state.batch_size[0]
         xs = torch.linspace(-width, width, steps=steps, device=state.device)
         ys = torch.linspace(-width, width, steps=steps, device=state.device)
         xx, yy = torch.meshgrid(xs, ys, indexing="xy")
-   
-        points = torch.stack([xx.ravel(), yy.ravel()], dim=1).expand(100, xx.numel(), 2)
+
+        points = torch.stack([xx.ravel(), yy.ravel()], dim=1).expand(n, xx.numel(), 2)
         fpred = vmap(partial(predict_fn, ensemble._base_model))
-        print(points.shape)
-        z = fpred(state.param_dict, state.buffer_dict, points)
+        z = fpred(state.params_dict, state.buffers_dict, points)
 
         z_mean = z.mean(dim=0).reshape_as(xx)
 
@@ -121,66 +125,106 @@ def plot_spirals(ax, points, labels):
         edgecolors = "white",
     )
 
+def parse_args():
+    # Outputs go next to this script, never into whatever directory you happen to
+    # have run from — `out/` is gitignored, so the repo stays clean.
+    default_out = Path(__file__).resolve().parent / "out"
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--outdir", type=Path, default=default_out,
+        help=f"where to write plots and checkpoints (default: {default_out})",
+    )
+    ap.add_argument(
+        "--show", action=argparse.BooleanOptionalAction, default=True,
+        help="open the figures in a window when done (default: --show)",
+    )
+    return ap.parse_args()
+
+
 if __name__ == "__main__":
-    device = "cuda"
+    args = parse_args()
+    args.outdir.mkdir(parents=True, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     num_replicas = 100
     num_samples = 100
     batch_size = 32
-    num_batches = 200
+    num_epochs = 20
+    batches_per_epoch = 20
 
     torch.manual_seed(0)
-    
+
     points, labels = make_spirals(num_samples, noise_std=0.05)
 
-    data_iterator = parallel_batch_iterator(
-        points, 
-        labels, 
-        num_replicas=num_replicas, 
-        batch_size=batch_size, 
-        num_batches=num_batches,
-    )
-
     print("Initialized dataset ...")
-    optimizer_cls = Adam
-    
-    ensemble , optimizer, state= StatelessModule.init(
+
+    ensemble, state = StatelessModule.init(
         make_classifier_module,
-        optimizer_cls,
-        model_init_args=(2, 512, 512, 1),
+        Adam,
+        2, 512, 512, 1,
         num_replicas=num_replicas,
-        device = device,
+        device=device,
         init_randomness="different",
     )
 
-    print(optimizer is optimizer_cls)
     print("Initialized ensemble for bootstrapping ...")
-    
-    history = ensemble.fit(
-        optimizer, 
-        binary_cross_entropy_with_logits,
-        state, 
-        data_iterator,
-        callbacks = [
-            ("checkpoint", Checkpoint(monitor="train_loss_best")),
-            ("early_stopping", EarlyStopping(monitor="train_loss")),
-        ]
-    )
 
-    
+    # Manual vmap training loop: differentiate the per-replica loss w.r.t. the
+    # per-name param views, then run the fused Adam over the whole ensemble.
+    def loss_fn(params, buffers, x, y):
+        return binary_cross_entropy_with_logits(ensemble(params, buffers, x), y)
+
+    grad_loss = vmap(grad_and_value(loss_fn, argnums=0), in_dims=(0, 0, 0, 0))
+
+    # Callbacks are just callables dropped into the loop: schedule the per-replica
+    # lr, snapshot the best rows, freeze plateaued replicas, time & print epochs.
+    score = EpochScore()
+    timer = EpochTimer()
+    sched = LRScheduler("CosineAnnealingLR", T_max=num_epochs)
+    ckpt = Checkpoint(root_dir=args.outdir / "spirals_ckpt", verbose=False)
+    early = EarlyStopping(patience=8, threshold=1e-3, verbose=False)
+    log = PrintLog()
+
+    epoch_losses = []  # per-epoch (N,) score, on host
+    for epoch in range(num_epochs):
+        timer.tic()
+        data_iterator = parallel_batch_iterator(
+            points, labels,
+            num_replicas=num_replicas, batch_size=batch_size,
+            num_batches=batches_per_epoch,
+        )
+        batch_losses = []  # per-batch (N,) loss, on-device
+        for X, Y, _ in data_iterator:
+            X, Y = X.to(device), Y.to(device)
+            grads, loss = grad_loss(state.params_dict, state.buffers_dict, X, Y)
+            Adam.apply_gradient(state, grads)
+            batch_losses.append(loss.detach())
+
+        s = score(batch_losses)                 # (N,) epoch loss
+        sched(state, s)                          # advance lr in place
+        improved = ckpt(state, s)                # snapshot best rows
+        epoch_losses.append(s.detach().cpu())
+        log(epoch=epoch, train_loss=s, train_loss_best=bool(improved.any()),
+            lr=state.optimizer_state["lr"], dur=timer.toc())
+        if early(state, s):                      # all replicas frozen?
+            break
+
+    early.restore_best(state)                    # roll frozen replicas back to best
+    ckpt.load_best(state)
     print("Training ensemble with bootstrapping done ...")
 
-    losses = torch.stack(*[loss for loss in history["batches"]["train_loss"]])
+    losses = torch.stack(epoch_losses)  # (num_epochs, N)
     dy, y = torch.std_mean(losses, dim=1)
-    x = torch.arange(num_batches)
+    x = torch.arange(losses.shape[0])
 
     fig0, ax0 = plt.subplots()
-    ax0.set_title("Cross entropy loss vs # minibatch iterations", weight="bold")
-    ax0.set_xlabel("minibatch iterations", weight="bold")
+    ax0.set_title("Cross entropy loss vs epoch", weight="bold")
+    ax0.set_xlabel("epoch", weight="bold")
     ax0.set_ylabel("loss", weight="bold")
     ax0.plot(x, y, "-", label="loss")
     ax0.fill_between(x, y-dy, y+dy, alpha=0.2, label=r"$\Delta$(loss)")
     ax0.legend()
-    fig0.savefig("loss.png")
+    fig0.savefig(args.outdir / "loss.png")
 
 
     xx, yy, z = predict_on_mesh(ensemble, state)
@@ -209,10 +253,11 @@ if __name__ == "__main__":
         alignment = "center",
     )
     fig.colorbar(im, ax=ax, label="mean prediction")
-    fig.savefig("predictions.png")
+    fig.savefig(args.outdir / "predictions.png")
     
-    show_plot = True
-    if show_plot:
+    print(f"wrote loss.png, predictions.png and spirals_ckpt/ to {args.outdir}")
+
+    if args.show:
         try:
             plt.show()
         except KeyboardInterrupt:

@@ -11,8 +11,7 @@ from torch.nn.functional import one_hot
 
 from torch.func import vmap
 
-from torch.utils.data import Sampler, SequentialSampler
-from torch.utils.data import BatchSampler
+from torch.utils.data import Sampler
 
 
 def random_split(
@@ -155,8 +154,9 @@ def undersample_and_random_split(
 
     subset_label = label[subset_idx] if label is not None else None
 
+    # One bincount pass instead of `num_unique_label` masked-equality scans.
     subset_label_counts = (
-        [subset_label[subset_label == l].shape[0] for l in range(num_unique_label)]
+        torch.bincount(subset_label, minlength=num_unique_label).tolist()
         if subset_label is not None
         else []
     )
@@ -387,6 +387,14 @@ def _undersample(
 
 
 class TensorBatchSampler(Sampler[LongTensor]):
+    """Yield contiguous batches of a pre-permuted ``source`` index tensor.
+
+    Batches are sequential slices along ``batch_dim`` (the caller shuffles
+    upstream, e.g. via ``random_split``/``undersample_and_random_split``), so
+    each batch is a cheap ``narrow`` **view** — no per-batch Python index list or
+    advanced-indexing gather.
+    """
+
     def __init__(
         self,
         source: Tensor,
@@ -396,24 +404,24 @@ class TensorBatchSampler(Sampler[LongTensor]):
     ) -> None:
         self.source = source
         self.batch_dim = batch_dim
+        self.batch_size = batch_size
+        self.drop_last = drop_last
         if self.source.shape[self.batch_dim] < batch_size:
             raise ValueError("Subsample size should be greater than batch size!")
 
-        self.batch_sampler = BatchSampler(
-            SequentialSampler(
-                torch.arange(self.source.shape[self.batch_dim]).to("meta")
-            ),
-            batch_size=batch_size,
-            drop_last=drop_last,
-        )
-
     def __iter__(self) -> Iterator[LongTensor]:
-        for batch_indices in self.batch_sampler:
-            index_slice = (slice(None),) * self.batch_dim
-            yield self.source[*index_slice, batch_indices, ...]
+        n = self.source.shape[self.batch_dim]
+        bs = self.batch_size
+        for start in range(0, n, bs):
+            size = min(bs, n - start)
+            if self.drop_last and size < bs:
+                break
+            yield self.source.narrow(self.batch_dim, start, size)
 
     def __len__(self) -> int:
-        return len(self.batch_sampler)
+        n = self.source.shape[self.batch_dim]
+        bs = self.batch_size
+        return n // bs if self.drop_last else -(-n // bs)
 
 
 class MultiSubsetBatchSampler(TensorBatchSampler):

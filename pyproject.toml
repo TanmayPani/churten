@@ -14,21 +14,33 @@ dependencies = [
   "torch",
   "torchvision",
   "tabulate",
-  "optree>=0.18.0",
   "beartype>=0.22.5",
   "helion>=1.1.0",
+  "plum-dispatch>=2.9.0",
+  "tensordict>=0.12.4",
 ]
 
 [dependency-groups]
 dev = [
+  # Build deps: torchstrap is built WITHOUT isolation (see [tool.uv] below), so
+  # the backend has to be resolvable from this environment.
+  "setuptools>=68",
+  "ninja>=1.11",
   "ipykernel>=6.29.5",
   "matplotlib>=3.10.6",
   "pyqt5>=5.15.11",
   "pyqt6>=6.9.0",
   "pyright>=1.1.398",
+  "pytest>=8.0",
   "tabulate>=0.9.0",
   "tqdm>=4.67.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+# test/backups/*.bak are old copies, not live code.
+norecursedirs = ["backups", "__pycache__", ".venv", "build", "dist"]
+addopts = "--strict-markers -ra"
 
 [tool.pyright]
 venvPath = "."
@@ -36,9 +48,14 @@ venv = ".venv"
 
 [tool.uv]
 prerelease = "allow"
+# `torchstrap._C` links against the torch that is installed here — its libraries,
+# its C++ ABI, its CUDA build. An isolated build environment would download a
+# *different* torch to compile against, which is how you get an extension that
+# imports with an undefined symbol. So: no isolation, and torch has to be in the
+# environment before the project is built (it is, as a runtime dependency).
+no-build-isolation-package = ["torchstrap"]
 
-[tool.uv.sources]
-optree = { git = "https://github.com/metaopt/optree.git" }
+#[tool.uv.sources]
 #torch = [
 #  { index = "pytorch-cu129"},
 #]
@@ -51,6 +68,12 @@ optree = { git = "https://github.com/metaopt/optree.git" }
 #url = "https://download.pytorch.org/whl/cu129"
 #explicit = true
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [build-system]
-requires = ["uv_build>=0.8.12,<0.9.0"]
-build-backend = "uv_build"
+# setuptools rather than uv_build because there is a C++/CUDA extension to
+# compile ahead of time; `torch` is a build requirement because setup.py imports
+# torch.utils.cpp_extension to do it.
+requires = ["setuptools>=68", "torch"]
+build-backend = "setuptools.build_meta"
